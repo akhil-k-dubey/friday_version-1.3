@@ -892,7 +892,7 @@ class StreamingVoiceCapture:
                 buf,
                 language=self.stt_language.split("-")[0],  # "en-IN" → "en"
                 beam_size=5,              # better accuracy
-                best_of=1,
+                best_of=3,                # 3 sampling passes → pick best (was 1)
                 vad_filter=True,          # Whisper's own VAD as second pass
                 vad_parameters={
                     "min_silence_duration_ms": 300,
@@ -901,20 +901,20 @@ class StreamingVoiceCapture:
                 condition_on_previous_text=False,
                 temperature=0.0,          # greedy — fastest + most consistent
                 # ── Anti-hallucination ──
-                no_speech_threshold=0.5,  # was 0.6 — tighter: drop >50% no-speech
-                log_prob_threshold=-0.6,  # was -0.8 — tighter: drop low-confidence
-                hallucination_silence_threshold=0.3,  # was 0.5 — more aggressive
+                no_speech_threshold=0.55,  # balanced: not too strict, not too lax
+                log_prob_threshold=-0.5,   # relaxed from -0.6 — was dropping real speech
+                hallucination_silence_threshold=0.3,
                 # ── Domain vocabulary ──
-                # Seeds the decoder so it knows these words exist.
-                # IMPORTANT: do NOT include common English words or brand names
-                # that Whisper might hallucinate on ambiguous/short audio.
-                # 'Ollama' was removed — it caused "Ollama Ollama Ollama"
-                # hallucinations on loopback-contaminated barge-in audio.
+                # Seeds the decoder with conversational context so it knows
+                # the domain and common phrases. More context = fewer misheard words.
                 initial_prompt=(
-                    "Akhil talking to his AI assistant named Friday. "
-                    "Common phrases: open notepad, close calculator, close notepad, "
-                    "multiply numbers, open calculator, search the web, play music, "
-                    "write code, what is the weather, add, subtract, divide."
+                    "Akhil is talking to his AI assistant named Friday. "
+                    "He gives voice commands like: open notepad, close calculator, "
+                    "open WhatsApp, send a message, search the web, play music, "
+                    "write code, what is the weather, how are you, go on, "
+                    "shut down, nice Friday, what are your skills, "
+                    "multiply, add, subtract, divide, calculate. "
+                    "Names he mentions: Akhil, Jay Singh, Friday."
                 ),
             )
             # Filter segments by confidence — drop low-quality ones unless it's a critical command
