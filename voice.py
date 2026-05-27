@@ -598,10 +598,13 @@ class VoiceIO:
         """
         Daemon thread: watches the mic via Silero VAD while speak_pipeline() runs.
 
-        Trigger rule: 4 consecutive 32ms chunks satisfying BOTH:
-          (a) speech_prob ≥ BARGE_IN_THRESHOLD (0.85)
-          (b) chunk RMS ≥ loopback_baseline_ema × RMS_GATE_MULTIPLIER (2.5×)
+        Trigger rule: 2 consecutive 32ms chunks satisfying BOTH:
+          (a) speech_prob ≥ BARGE_IN_THRESHOLD (0.80)
+          (b) chunk RMS ≥ loopback_baseline_ema × RMS_GATE_MULTIPLIER (2.2×)
         → fires stop_playback() to cut TTS immediately.
+
+        After confirmation, drains barge_q for ~300ms to capture the user's
+        full interrupted sentence before handing off to listen_for_utterance().
 
         WHY DUAL GATE:
         The stream stays live during TTS (single-stream WASAPI design), so the
@@ -613,9 +616,8 @@ class VoiceIO:
              user's voice directly into the mic. The EMA baseline tracks the
              loopback energy level; real speech must be louder (× RMS_GATE_MULTIPLIER).
 
-          2. Duration (CONFIRM_CHUNKS=4 = 128ms): loopback spikes from a single
-             TTS word are brief (2-3 chunks); deliberate user interruption sustains
-             for 200ms+ (≥4 chunks for any normally spoken word).
+          2. Duration (CONFIRM_CHUNKS=2 = 64ms): fast trigger for responsive
+             interruption. 2 grace misses tolerate natural energy dips.
 
         Tune RMS_GATE_MULTIPLIER lower (2.0) if barge-in is hard to trigger,
         higher (3.5) if speaker loopback still causes false positives.
@@ -623,8 +625,8 @@ class VoiceIO:
         if np is None or self._streaming_capture is None:
             return
 
-        BARGE_IN_THRESHOLD  = 0.88   # raise slightly — more selective for human voice
-        CONFIRM_CHUNKS      = 4      # 4×32ms=128ms — still deliberate, less than fan sustain
+        BARGE_IN_THRESHOLD  = 0.80   # lowered: more sensitive to human voice
+        CONFIRM_CHUNKS      = 2      # 2×32ms=64ms — fast trigger, still deliberate
         CHUNK_SIZE          = 512    # 32ms at 16kHz — Silero requirement
         RMS_GATE_MULTIPLIER = 2.2    # slightly easier for real user voice to beat (tuned from 3.0)
         RMS_EMA_ALPHA       = 0.12   # EMA smoothing for loopback baseline
@@ -644,7 +646,7 @@ class VoiceIO:
         # Grace-miss counter: allows 1 soft-miss per barge-in run.
         # Human speech has natural inter-phoneme energy dips; a single weak
         # 32ms chunk should NOT destroy a confirmed run.
-        _grace_remaining = 1
+        _grace_remaining = 2   # allow 2 natural energy dips (was 1)
         # Speech chunks that passed BOTH gates — saved to pre-buffer on confirm.
         # Reset whenever consecutive drops to 0 (loopback broke the run).
         speech_chunks: list = []
@@ -714,7 +716,7 @@ class VoiceIO:
         )
 
         import collections
-        rolling_prebuf = collections.deque(maxlen=15)
+        rolling_prebuf = collections.deque(maxlen=25)  # ~800ms of onset capture
 
         try:
             while not stop_event.is_set():
@@ -747,12 +749,10 @@ class VoiceIO:
 
                 prob = vad.speech_prob(chunk)
                 rms  = float(np.sqrt(np.mean(chunk ** 2)))
-                rms_required = max(RMS_FLOOR, min(rms_baseline_ema, dynamic_max_baseline)) * dynamic_multiplier
-                
-                # Active TTS loopback scaling: require voice to beat loopback noise floor
-                loopback_floor = max(0.008, max_loopback * 1.3)
-                if rms_required < loopback_floor:
-                    rms_required = loopback_floor
+                rms_required = max(
+                    max_loopback * 1.3,  # must beat measured loopback by 30%
+                    max(RMS_FLOOR, min(rms_baseline_ema, dynamic_max_baseline)) * dynamic_multiplier
+                )
 
                 if prob >= BARGE_IN_THRESHOLD:
                     # ── RMS relative gate ──────────────────────────────────
@@ -776,16 +776,40 @@ class VoiceIO:
                         if consecutive >= _confirm_target:
                             if stop_event.is_set():
                                 return
-                            # Verify speaker voiceprint before triggering barge-in!
-                            # During active TTS playback, loopback contamination makes strict verification extremely fragile.
-                            # We check and log the speaker similarity for diagnostics, but bypass rejection to ensure instant Siri/Copilot-grade responsiveness.
-                            self._verify_speaker(speech_chunks)
-                            
+                            # NOTE: Speaker verification (voiceprint) is intentionally
+                            # SKIPPED during barge-in. The mic audio contains TTS
+                            # loopback mixed with the user's voice, so the mel
+                            # spectrogram never matches the clean enrolled voiceprint.
+                            # The RMS + VAD dual gate is sufficient to separate
+                            # loopback from real speech.
+
                             self._debug("[barge-in] CONFIRMED — saving audio + stopping playback")
                             _barge_in_confirmed = True
                             
-                            # Save ALL rolling pre-buffer 16kHz chunks (~480ms of onset)
-                            all_processed = list(rolling_prebuf)
+                            # ── Drain barge_q for ~300ms to capture the user's full sentence ──
+                            # After confirmation, the user is still talking. We need to
+                            # grab those chunks before stop_playback() kills the route.
+                            drain_deadline = time.monotonic() + 0.30
+                            drain_chunks = []
+                            while time.monotonic() < drain_deadline:
+                                try:
+                                    drain_raw = barge_q.get(timeout=0.04)
+                                    if drain_raw is None:
+                                        break
+                                    if self._streaming_capture._denoiser is not None:
+                                        drain_chunk = drain_raw[::self._streaming_capture._DECIMATE]
+                                    else:
+                                        drain_chunk = drain_raw
+                                    if len(drain_chunk) < CHUNK_SIZE:
+                                        drain_chunk = np.pad(drain_chunk, (0, CHUNK_SIZE - len(drain_chunk)))
+                                    elif len(drain_chunk) > CHUNK_SIZE:
+                                        drain_chunk = drain_chunk[:CHUNK_SIZE]
+                                    drain_chunks.append(drain_chunk.copy())
+                                except queue.Empty:
+                                    continue
+
+                            # Save ALL rolling pre-buffer + drain chunks (~800ms + 300ms of onset)
+                            all_processed = list(rolling_prebuf) + drain_chunks
                             with self._streaming_capture._barge_in_lock:
                                 self._streaming_capture._barge_in_audio_buffer = all_processed
                             self._debug(
@@ -816,7 +840,7 @@ class VoiceIO:
                             consecutive = 0
                             speech_chunks = []       # reset — this run was loopback
                             speech_chunks_raw = []
-                            _grace_remaining = 1     # restore grace for next run
+                            _grace_remaining = 2     # restore grace for next run
                             self._debug(
                                 f"[barge-in] prob={prob:.2f} rms={rms:.4f} "
                                 f"need≥{rms_required:.4f} loopback"
@@ -841,7 +865,7 @@ class VoiceIO:
                         consecutive = 0
                         speech_chunks = []
                         speech_chunks_raw = []
-                        _grace_remaining = 1
+                        _grace_remaining = 2
                         if rms < rms_required:
                             rms_baseline_ema = min(
                                 MAX_BASELINE,
@@ -851,7 +875,7 @@ class VoiceIO:
                     consecutive = 0
                     speech_chunks = []
                     speech_chunks_raw = []
-                    _grace_remaining = 1
+                    _grace_remaining = 2
                     # Quiet/noise chunk: do NOT update baseline.
         finally:
             # Only zero the cooldown on a NATURAL pipeline end where the user
@@ -969,40 +993,46 @@ class VoiceIO:
         # ── Main thread: playback ──
         # _play_audio() sees already_muted=True (we set _speaking above) and
         # skips its own pause_for_tts / resume_after_tts on every sentence.
-        while True:
-            try:
-                result = audio_q.get(timeout=60.0)
-            except queue.Empty:
-                break
-            if result is None:
-                break  # sentinel
-            if self._playback_stop.is_set():
-                break
-            samples, sample_rate, text = result
-            try:
-                _playback_started.set()
-                self._play_audio(samples, sample_rate)
-                self._last_tts_time = time.monotonic()
-                if not self._playback_stop.is_set():
-                    self.played_sentences.append(text)
-            except Exception as e:
-                self._debug(f"Pipeline play failed: {e}")
-
-        # ── Single clean handoff — normal finish OR barge-in ─────────────
-        # Stop monitor first (deregisters barge_q), then restore mic.
-        # Pass barge_in=True when the user interrupted — resume skips the
-        # 300ms echo-decay sleep so we don't clip the word they just spoke.
-        _barge_in_stop.set()
-        # Wake the monitor immediately (it may be blocked on barge_q.get)
+        #
+        # CRITICAL: entire block in try/finally so resume_after_tts() ALWAYS
+        # runs — a WASAPI crash must not leave the pipeline stuck in SPEAKING.
         try:
-            barge_q = self._streaming_capture._barge_in_queue if self._streaming_capture else None
-            if barge_q is not None:
-                barge_q.put_nowait(None)  # sentinel wakes the get() call
-        except Exception:
-            pass
-        if self._streaming_capture:
-            was_barge_in = self._streaming_capture._barge_in_fired
-            self._streaming_capture.resume_after_tts(barge_in=was_barge_in)
+            while True:
+                try:
+                    result = audio_q.get(timeout=60.0)
+                except queue.Empty:
+                    break
+                if result is None:
+                    break  # sentinel
+                if self._playback_stop.is_set():
+                    break
+                samples, sample_rate, text = result
+                try:
+                    _playback_started.set()
+                    self._play_audio(samples, sample_rate)
+                    self._last_tts_time = time.monotonic()
+                    if not self._playback_stop.is_set():
+                        self.played_sentences.append(text)
+                        self._debug(f"Spoke: {text[:60]}")
+                except Exception as e:
+                    self._debug(f"Pipeline play failed: {e}")
+        except Exception as e:
+            self._debug(f"Pipeline loop crashed: {e}")
+        finally:
+            # ── Single clean handoff — normal finish OR barge-in ─────────
+            # ALWAYS runs: stop monitor, restore mic, clear queues.
+            _barge_in_stop.set()
+            try:
+                barge_q = self._streaming_capture._barge_in_queue if self._streaming_capture else None
+                if barge_q is not None:
+                    barge_q.put_nowait(None)
+            except Exception:
+                pass
+            if self._streaming_capture:
+                was_barge_in = self._streaming_capture._barge_in_fired
+                self._streaming_capture.resume_after_tts(barge_in=was_barge_in)
+            self._sentence_q = None
+            self._audio_q = None
 
     def stop_playback(self) -> None:
         """Barge-in: stop sounddevice playback immediately.
